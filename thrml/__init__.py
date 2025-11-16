@@ -22,6 +22,7 @@ from .conditional_samplers import SoftmaxConditional as SoftmaxConditional
 from .factor import AbstractFactor as AbstractFactor
 from .factor import FactorSamplingProgram as FactorSamplingProgram
 from .factor import WeightedFactor as WeightedFactor
+from .graph_utils import make_graph as make_graph
 from .interaction import InteractionGroup as InteractionGroup
 from .observers import AbstractObserver as AbstractObserver
 from .observers import MomentAccumulatorObserver as MomentAccumulatorObserver

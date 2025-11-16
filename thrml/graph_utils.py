@@ -1,14 +1,17 @@
 import math
+
 import jax
 import jax.numpy as jnp
-from .pgm import SpinNode
+
 from .block_management import Block
+from .pgm import SpinNode
+
 
 def make_graph(
     side_len: int,
     torus: bool,
 ) -> tuple:
-    jumps = [(1,0), (2, 1), (3, 2), (1, 4)]
+    jumps = [(1, 0), (2, 1), (3, 2), (1, 4)]
     side_len = math.ceil(side_len / 2) * 2
     size = side_len**2
 
@@ -28,9 +31,7 @@ def make_graph(
         i, j = get_coords(idx)
         return jnp.array([idx, get_idx(i + di, j + dj)])
 
-    make_edge_arr = jax.jit(
-        jax.vmap(make_edge_single, in_axes=(0, None, None), out_axes=0)
-    )
+    make_edge_arr = jax.jit(jax.vmap(make_edge_single, in_axes=(0, None, None), out_axes=0))
 
     indices = jnp.arange(size)
     edge_arrs_list = []
