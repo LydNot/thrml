@@ -52,3 +52,4 @@ echo ""
 echo "Expected runtime: 1-2 hours on H100"
 echo "Cost estimate: ~$2.50 for full run"
 
+

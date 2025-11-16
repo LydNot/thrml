@@ -181,3 +181,4 @@ python mnist_real_training.py
 
 Your first **real** information dynamics experiment awaits!
 
+

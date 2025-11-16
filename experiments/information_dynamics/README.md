@@ -25,3 +25,4 @@ We expect to see:
 - Gap between Bayesian MI and V-information reveals "unusable" information
 - This gap may explain why EBMs are hard to work with in practice
 
+

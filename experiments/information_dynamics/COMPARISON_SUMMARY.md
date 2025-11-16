@@ -167,3 +167,4 @@ mi = estimate_discrete_mi(key, latent_samples, label_samples)
 - Block Gibbs sampling: https://proceedings.mlr.press/v15/gonzalez11a/gonzalez11a.pdf
 - Our experiments: `experiments/information_dynamics/`
 
+

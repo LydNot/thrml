@@ -196,3 +196,4 @@ if __name__ == "__main__":
     print("Key insight: Even if latents encode information (high Bayesian MI),")
     print("we can only extract it with sufficient computational budget!")
 
+

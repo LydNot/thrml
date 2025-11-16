@@ -322,3 +322,4 @@ if __name__ == "__main__":
     print(f"  V-info (100 steps): {tracker.v_info_100_steps[-1]:.3f} bits")
     print(f"  Information gap: {tracker.info_gap_100[-1]:.3f} bits")
 
+
