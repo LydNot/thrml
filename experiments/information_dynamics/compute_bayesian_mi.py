@@ -50,40 +50,66 @@ def estimate_discrete_mi(
     # Compute empirical distributions
     # For simplicity, compute MI between aggregated latent and label states
     # (full joint over all variables would be exponentially large)
-    
-    # Aggregate by summing (proxy for joint state)
+
+    # Aggregate latents by summing (proxy for joint state)
     latent_sum = jnp.sum(latent_int, axis=-1)  # [n_samples]
-    label_sum = jnp.sum(label_int, axis=-1)    # [n_samples]
+
+    # For labels, detect if it's a replicated one-hot encoding
+    # (constant sum indicates one-hot style encoding)
+    label_sums = jnp.sum(label_int, axis=-1)
+    if jnp.std(label_sums) < 0.1:  # Constant sum (like one-hot)
+        # Decode which class is active instead of summing
+        # For replicated encoding (30 bits = 3×10 classes), find active group
+        n_labels = label_samples.shape[1]
+        if n_labels == 30:  # MNIST with pattern replication
+            # The same 3-bit pattern repeats 10 times
+            # Extract the pattern from first 3 bits
+            pattern = label_int[:, :3]  # [n_samples, 3]
+            # Encode pattern as integer: [1,0,0]→0, [0,1,0]→1, [0,0,1]→2
+            label_class = pattern[:, 0] * 0 + pattern[:, 1] * 1 + pattern[:, 2] * 2
+        else:
+            # General one-hot: find first active bit
+            label_class = jnp.argmax(label_int, axis=1)
+        label_aggregated = label_class
+        max_label = 3 if n_labels == 30 else n_labels  # Number of patterns
+    else:
+        # Variable sum - use sum as before
+        label_aggregated = jnp.sum(label_int, axis=-1)
+        max_label = label_samples.shape[1]
     
     # Compute empirical probabilities
     def compute_entropy(values: Array, max_val: int) -> float:
         """Compute entropy of discrete distribution."""
         counts = jnp.array([jnp.sum(values == i) for i in range(max_val + 1)])
         probs = counts / n_samples
-        # Add small epsilon to avoid log(0)
-        probs = jnp.clip(probs, 1e-10, 1.0)
-        entropy = -jnp.sum(probs * jnp.log2(probs))
+        # Only compute entropy for non-zero probabilities to avoid log(0)
+        mask = probs > 0
+        entropy = -jnp.sum(jnp.where(mask, probs * jnp.log2(probs), 0.0))
         return entropy
     
     max_latent = latent_samples.shape[1]
-    max_label = label_samples.shape[1]
-    
+
     h_latent = compute_entropy(latent_sum, max_latent)
-    h_label = compute_entropy(label_sum, max_label)
+    h_label = compute_entropy(label_aggregated, max_label - 1 if max_label > 1 else 0)  # max_label-1 because classes are 0-indexed
     
     # Joint entropy - compute 2D histogram
-    joint_counts = jnp.zeros((max_latent + 1, max_label + 1))
+    joint_counts = jnp.zeros((max_latent + 1, max_label))
     for i in range(n_samples):
         l_val = latent_sum[i]
-        lab_val = label_sum[i]
+        lab_val = label_aggregated[i]
         joint_counts = joint_counts.at[l_val, lab_val].add(1)
-    
+
     joint_probs = joint_counts / n_samples
-    joint_probs = jnp.clip(joint_probs, 1e-10, 1.0)
-    h_joint = -jnp.sum(joint_probs * jnp.log2(joint_probs))
-    
+    # Only compute entropy for non-zero probabilities
+    mask = joint_probs > 0
+    h_joint = -jnp.sum(jnp.where(mask, joint_probs * jnp.log2(joint_probs), 0.0))
+
     mi = h_latent + h_label - h_joint
-    
+
+    # Clamp to non-negative (MI cannot be negative by definition)
+    # Small negative values are numerical errors when true MI ≈ 0
+    mi = jnp.maximum(mi, 0.0)
+
     return float(mi)
 
 
@@ -174,22 +200,26 @@ def compute_conditional_entropy(
     # Compute H(X)
     latent_counts = jnp.array([jnp.sum(latent_sum == i) for i in range(max_latent + 1)])
     latent_probs = latent_counts / n_samples
-    latent_probs = jnp.clip(latent_probs, 1e-10, 1.0)
-    h_latent = -jnp.sum(latent_probs * jnp.log2(latent_probs))
-    
+    mask_latent = latent_probs > 0
+    h_latent = -jnp.sum(jnp.where(mask_latent, latent_probs * jnp.log2(latent_probs), 0.0))
+
     # Compute H(X,Y)
     joint_counts = jnp.zeros((max_latent + 1, max_label + 1))
     for i in range(n_samples):
         l_val = latent_sum[i]
         lab_val = label_sum[i]
         joint_counts = joint_counts.at[l_val, lab_val].add(1)
-    
+
     joint_probs = joint_counts / n_samples
-    joint_probs = jnp.clip(joint_probs, 1e-10, 1.0)
-    h_joint = -jnp.sum(joint_probs * jnp.log2(joint_probs))
+    mask_joint = joint_probs > 0
+    h_joint = -jnp.sum(jnp.where(mask_joint, joint_probs * jnp.log2(joint_probs), 0.0))
     
     conditional_entropy = h_joint - h_latent
-    
+
+    # Conditional entropy can theoretically be negative in edge cases
+    # but should be clamped to 0 for practical purposes
+    conditional_entropy = jnp.maximum(conditional_entropy, 0.0)
+
     return float(conditional_entropy)
 
 

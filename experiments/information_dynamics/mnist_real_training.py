@@ -16,14 +16,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import time
+import sys
 from pathlib import Path
 from datetime import datetime
 
 from thrml.block_management import Block
-from thrml.block_sampling import SamplingSchedule, sample_states  
+from thrml.block_sampling import SamplingSchedule, sample_states
 from thrml.models.ising import IsingEBM, IsingSamplingProgram, hinton_init
 from thrml.pgm import SpinNode
 
+# Add script directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
 from compute_bayesian_mi import estimate_discrete_mi
 
 # Check GPU availability
@@ -35,7 +38,7 @@ print()
 def load_and_prepare_mnist():
     """Load real MNIST data."""
     print("Loading MNIST data...")
-    data = jnp.load('../tests/mnist_test_data/train_data_filtered.npy')
+    data = jnp.load('../../tests/mnist_test_data/train_data_filtered.npy')
     
     # Separate pixels and labels
     n_pixels_full = 28 * 28
@@ -105,42 +108,189 @@ def subsample_mnist(pixels, labels, n_samples, n_pixel_features, key):
     return visible_data
 
 
-def sample_hidden_given_visible(model, visible_block, hidden_block, visible_data, 
+def sample_hidden_given_visible(model, visible_block, hidden_block, visible_data,
                                 n_samples, n_gibbs_steps, key):
     """
     Sample hidden states given visible data using THRML.
-    
+
     This is the actual Gibbs sampling step.
+    Optimized to process samples in smaller batches for efficiency.
     """
     free_blocks = [hidden_block]
     clamped_blocks = [visible_block]
     program = IsingSamplingProgram(model, free_blocks, clamped_blocks)
-    
+
     schedule = SamplingSchedule(
         n_warmup=20,
         n_samples=1,
         steps_per_sample=n_gibbs_steps
     )
-    
+
     # Initialize
     init_states = hinton_init(key, model, free_blocks, (n_samples,))
-    
-    # Sample one at a time (could batch but this is clearer)
+
+    # Process in batches to balance memory and efficiency
+    batch_size = min(10, n_samples)  # Process up to 10 samples at once
+    n_batches = (n_samples + batch_size - 1) // batch_size
     hidden_samples = []
-    keys = jax.random.split(key, n_samples)
-    
-    for i in range(n_samples):
-        samples = sample_states(
-            keys[i],
-            program,
-            schedule,
-            [init_states[0][i]],  # Shape: (n_hidden,)
-            [visible_data[i]],    # Shape: (n_visible,)
-            [hidden_block]
+    keys = jax.random.split(key, n_batches)
+
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_len = end_idx - start_idx
+
+        # Process batch in parallel using vmap
+        def sample_single(i, k):
+            samples = sample_states(
+                k,
+                program,
+                schedule,
+                [init_states[0][start_idx + i]],  # Shape: (n_hidden,)
+                [visible_data[start_idx + i]],    # Shape: (n_visible,)
+                [hidden_block]
+            )
+            return samples[0][0]  # Extract first sample, first block
+
+        # Use vmap to parallelize within batch
+        batch_keys = jax.random.split(keys[batch_idx], batch_len)
+        batch_results = jax.vmap(sample_single)(
+            jnp.arange(batch_len),
+            batch_keys
         )
-        hidden_samples.append(samples[0][0])  # Extract first sample, first block
-    
-    return jnp.stack(hidden_samples)
+        hidden_samples.append(batch_results)
+
+    return jnp.concatenate(hidden_samples, axis=0)
+
+
+def sample_visible_given_hidden(model, visible_block, hidden_block, hidden_data,
+                                n_samples, n_gibbs_steps, key):
+    """
+    Sample visible states given hidden data using THRML.
+
+    This is used for the negative phase in contrastive divergence.
+    Optimized to process samples in smaller batches for efficiency.
+    """
+    free_blocks = [visible_block]
+    clamped_blocks = [hidden_block]
+    program = IsingSamplingProgram(model, free_blocks, clamped_blocks)
+
+    schedule = SamplingSchedule(
+        n_warmup=10,
+        n_samples=1,
+        steps_per_sample=n_gibbs_steps
+    )
+
+    # Initialize
+    init_states = hinton_init(key, model, free_blocks, (n_samples,))
+
+    # Process in batches to balance memory and efficiency
+    batch_size = min(10, n_samples)  # Process up to 10 samples at once
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    visible_samples = []
+    keys = jax.random.split(key, n_batches)
+
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_len = end_idx - start_idx
+
+        # Process batch in parallel using vmap
+        def sample_single(i, k):
+            samples = sample_states(
+                k,
+                program,
+                schedule,
+                [init_states[0][start_idx + i]],  # Shape: (n_visible,)
+                [hidden_data[start_idx + i]],     # Shape: (n_hidden,)
+                [visible_block]
+            )
+            return samples[0][0]  # Extract first sample, first block
+
+        # Use vmap to parallelize within batch
+        batch_keys = jax.random.split(keys[batch_idx], batch_len)
+        batch_results = jax.vmap(sample_single)(
+            jnp.arange(batch_len),
+            batch_keys
+        )
+        visible_samples.append(batch_results)
+
+    return jnp.concatenate(visible_samples, axis=0)
+
+
+def compute_cd_gradients(model, visible_block, hidden_block, data_batch,
+                         cd_steps, key):
+    """
+    Compute gradients using Contrastive Divergence (CD-k).
+
+    CD-k algorithm:
+    1. Clamp visible to data, sample hidden (positive phase)
+    2. Run k steps of Gibbs sampling (negative phase)
+    3. Compute gradient as difference between phases
+
+    Args:
+        model: Current IsingEBM model
+        visible_block: Block of visible nodes
+        hidden_block: Block of hidden nodes
+        data_batch: Batch of training data [batch_size, n_visible]
+        cd_steps: Number of Gibbs steps for negative phase (k in CD-k)
+        key: JAX random key
+
+    Returns:
+        (weight_grad, bias_grad): Gradients for weights and biases
+    """
+    batch_size = data_batch.shape[0]
+    n_visible = len(visible_block)
+    n_hidden = len(hidden_block)
+
+    # Positive phase: sample hidden given data
+    key, k_pos = jax.random.split(key)
+    hidden_pos = sample_hidden_given_visible(
+        model, visible_block, hidden_block, data_batch,
+        batch_size, n_gibbs_steps=1, key=k_pos
+    )
+
+    # Negative phase: run CD-k steps
+    key, k_neg_h, k_neg_v = jax.random.split(key, 3)
+
+    # Start from positive phase hidden states
+    visible_neg = sample_visible_given_hidden(
+        model, visible_block, hidden_block, hidden_pos,
+        batch_size, n_gibbs_steps=cd_steps, key=k_neg_v
+    )
+
+    hidden_neg = sample_hidden_given_visible(
+        model, visible_block, hidden_block, visible_neg,
+        batch_size, n_gibbs_steps=1, key=k_neg_h
+    )
+
+    # Convert boolean to float for correlation computation
+    data_float = data_batch.astype(jnp.float32) * 2 - 1  # {0,1} -> {-1,1}
+    hidden_pos_float = hidden_pos.astype(jnp.float32) * 2 - 1
+    visible_neg_float = visible_neg.astype(jnp.float32) * 2 - 1
+    hidden_neg_float = hidden_neg.astype(jnp.float32) * 2 - 1
+
+    # Compute correlations for weight gradients (visible <-> hidden)
+    # Positive phase: <v_i h_j>_data
+    pos_corr = jnp.mean(data_float[:, :, None] * hidden_pos_float[:, None, :], axis=0)
+    # Negative phase: <v_i h_j>_model
+    neg_corr = jnp.mean(visible_neg_float[:, :, None] * hidden_neg_float[:, None, :], axis=0)
+
+    # Weight gradient: positive - negative correlations
+    # Flatten to match edge order (all v-h pairs)
+    weight_grad = (pos_corr - neg_corr).flatten()
+
+    # Bias gradients
+    visible_pos_mean = jnp.mean(data_float, axis=0)
+    visible_neg_mean = jnp.mean(visible_neg_float, axis=0)
+    hidden_pos_mean = jnp.mean(hidden_pos_float, axis=0)
+    hidden_neg_mean = jnp.mean(hidden_neg_float, axis=0)
+
+    visible_bias_grad = visible_pos_mean - visible_neg_mean
+    hidden_bias_grad = hidden_pos_mean - hidden_neg_mean
+    bias_grad = jnp.concatenate([visible_bias_grad, hidden_bias_grad])
+
+    return weight_grad, bias_grad
 
 
 def run_real_mnist_experiment(
@@ -150,6 +300,9 @@ def run_real_mnist_experiment(
     n_pixel_features=100,
     info_sampling_chains=50,
     budgets=[10, 50, 100],
+    learning_rate=0.01,
+    cd_steps=1,
+    batch_size=100,
 ):
     """
     Main experiment: Real EBM training with information tracking.
@@ -165,6 +318,9 @@ def run_real_mnist_experiment(
     print(f"  Hidden units: {n_hidden}")
     print(f"  Training samples: {n_samples}")
     print(f"  Pixel features: {n_pixel_features}")
+    print(f"  Learning rate: {learning_rate}")
+    print(f"  CD steps: {cd_steps}")
+    print(f"  Batch size: {batch_size}")
     print(f"  Sampling budgets: {budgets}")
     print()
     
@@ -206,19 +362,49 @@ def run_real_mnist_experiment(
         print(f"\n{'='*70}")
         print(f"EPOCH {epoch + 1}/{n_epochs}")
         print(f"{'='*70}")
-        
-        # TODO: Add actual parameter updates here
-        # For now, we simulate learning by adding small updates
-        if epoch > 0:
-            key, k_update = jax.random.split(key)
-            # Small random updates to simulate learning
-            bias_update = jax.random.normal(k_update, model.biases.shape) * 0.02 * epoch
+
+        # Actual training with Contrastive Divergence
+        print(f"\nTraining with CD-{cd_steps}...")
+
+        # Shuffle data and create mini-batches
+        key, k_shuffle = jax.random.split(key)
+        perm = jax.random.permutation(k_shuffle, n_samples)
+        shuffled_data = visible_data[perm]
+
+        n_batches = max(1, n_samples // batch_size)
+        epoch_weight_grad_norm = 0.0
+        epoch_bias_grad_norm = 0.0
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_samples)
+            batch_data = shuffled_data[start_idx:end_idx]
+
+            # Compute gradients via CD
+            key, k_cd = jax.random.split(key)
+            weight_grad, bias_grad = compute_cd_gradients(
+                model, visible_block, hidden_block,
+                batch_data, cd_steps, k_cd
+            )
+
+            # Update parameters
+            new_weights = model.weights + learning_rate * weight_grad
+            new_biases = model.biases + learning_rate * bias_grad
+
             model = IsingEBM(
                 model.nodes, model.edges,
-                model.biases + bias_update,
-                model.weights,
-                model.beta
+                new_biases, new_weights, model.beta
             )
+
+            # Track gradient norms
+            epoch_weight_grad_norm += jnp.linalg.norm(weight_grad)
+            epoch_bias_grad_norm += jnp.linalg.norm(bias_grad)
+
+        avg_weight_grad_norm = epoch_weight_grad_norm / n_batches
+        avg_bias_grad_norm = epoch_bias_grad_norm / n_batches
+
+        print(f"  Avg weight grad norm: {avg_weight_grad_norm:.4f}")
+        print(f"  Avg bias grad norm: {avg_bias_grad_norm:.4f}")
         
         # Compute Bayesian MI (sample hidden given visible)
         print(f"\nComputing Bayesian MI...")
